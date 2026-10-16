@@ -1,0 +1,24 @@
+{
+  "camera": 1,
+  "source": "realsense",
+  "color": "ir",
+
+  "camera_width": 1280,
+  "camera_height": 720,
+
+  "top_left": [0, 0],
+  "bottom_right": [1279, 719],
+
+  "screen_width": 1920,
+  "screen_height": 1080,
+
+  "min_area": 4.0,
+  "smoothing": 0.35,
+  "realsense_stream": "infrared",
+  "realsense_index": 1,
+  "realsense_fps": 30,
+  "disable_emitter": true,
+  "ir_min_value": 180,
+  "mouse_control": true,
+  "inside_frame": true
+}
