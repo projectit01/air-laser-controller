@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import ctypes.wintypes
 import json
+import msvcrt
 from pathlib import Path
 import sys
 import time
@@ -53,13 +55,31 @@ DEFAULT_CONFIG = {
     "screen_width": 1920,
     "screen_height": 1080,
     "min_area": 4.0,
+    "max_area": 2000.0,
+    "min_pointer_area": 20.0,
+    "max_pointer_aspect": 2.5,
+    "min_pointer_circularity": 0.45,
+    "max_track_jump": 140.0,
+    "max_lost_frames": 4,
+    "fusion_max_distance": 40.0,
+    "red_min_area": 5.0,
+    "red_max_area": 1000.0,
+    "background_subtraction": True,
+    "background_history": 120,
+    "background_var_threshold": 24.0,
+    "background_learning_rate": 0.001,
     "smoothing": 0.35,
     "realsense_stream": "infrared",
     "realsense_index": 1,
     "realsense_fps": 30,
     "disable_emitter": True,
+    "exposure": 1000,
+    "gain": 16,
+    "auto_exposure": False,
     "ir_min_value": 180,
+    "ir_local_threshold": 40,
     "mouse_control": False,
+    "no_preview": False,
 }
 
 
@@ -79,6 +99,16 @@ class MouseController:
         self.last_position = point
 
 
+def get_cursor_position() -> tuple[int, int] | None:
+    """Return the current Windows cursor position, when available."""
+    if sys.platform != "win32":
+        return None
+    point = ctypes.wintypes.POINT()
+    if ctypes.windll.user32.GetCursorPos(ctypes.byref(point)):
+        return point.x, point.y
+    return None
+
+
 def load_config(path: str) -> dict:
     config = dict(DEFAULT_CONFIG)
     try:
@@ -91,6 +121,12 @@ def load_config(path: str) -> dict:
     except json.JSONDecodeError as error:
         print(f"Invalid config file {path}: {error}", file=sys.stderr)
     return config
+
+
+def save_config(path: str, config: dict) -> None:
+    with Path(path).open("w", encoding="utf-8") as file:
+        json.dump(config, file, ensure_ascii=False, indent=2)
+        file.write("\n")
 
 
 def parse_args() -> argparse.Namespace:
@@ -148,6 +184,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-preview",
         action="store_true",
+        default=None,
         help="Do not open a preview window; coordinates are still printed",
     )
     return parser.parse_args()
@@ -159,7 +196,12 @@ def make_mask(frame: np.ndarray, color: str, ir_min_value: int) -> np.ndarray:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         else:
             gray = frame
-        mask = cv2.inRange(gray, ir_min_value, 255)
+        # IR projector/screen areas can be broadly saturated.  A white
+        # top-hat keeps small local highlights (the laser spot) while
+        # suppressing large, uniformly bright regions.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (31, 31))
+        local_bright = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
+        mask = cv2.inRange(local_bright, ir_min_value, 255)
         kernel = np.ones((3, 3), dtype=np.uint8)
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
@@ -179,15 +221,82 @@ def make_mask(frame: np.ndarray, color: str, ir_min_value: int) -> np.ndarray:
     return mask
 
 
-def find_laser_point(mask: np.ndarray, min_area: float) -> tuple[int, int] | None:
+def find_red_point(
+    frame: np.ndarray, min_area: float = 5.0, max_area: float = 1000.0
+) -> tuple[int, int] | None:
+    """Find a compact red pointer candidate in an RGB/BGR frame."""
+    mask = make_mask(frame, "red", 0)
+    return find_laser_point(mask, min_area, max_area, min_area, 2.5)
+
+
+def find_laser_point(
+    mask: np.ndarray, min_area: float, max_area: float,
+    min_pointer_area: float, max_pointer_aspect: float,
+    brightness: np.ndarray | None = None,
+    preferred_point: tuple[int, int] | None = None,
+    min_circularity: float = 0.45,
+    max_track_jump: float = 140.0,
+) -> tuple[int, int] | None:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         return None
 
-    contour = max(contours, key=cv2.contourArea)
-    area = cv2.contourArea(contour)
-    if area < min_area:
+    candidates = []
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area < max(min_area, min_pointer_area) or area > max_area:
+            continue
+        x, y, width, height = cv2.boundingRect(contour)
+        if width == 0 or height == 0:
+            continue
+        aspect = max(width / height, height / width)
+        if aspect > max_pointer_aspect:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        circularity = (4 * np.pi * area / (perimeter * perimeter)) if perimeter else 0
+        if circularity < min_circularity:
+            continue
+        candidates.append(contour)
+    if not candidates:
         return None
+    if preferred_point is not None:
+        px, py = preferred_point
+        nearby = []
+        for candidate in candidates:
+            moments = cv2.moments(candidate)
+            if moments["m00"] == 0:
+                continue
+            cx = moments["m10"] / moments["m00"]
+            cy = moments["m01"] / moments["m00"]
+            if (cx - px) ** 2 + (cy - py) ** 2 <= max_track_jump ** 2:
+                nearby.append(candidate)
+        if nearby:
+            candidates = nearby
+        else:
+            return None
+        def candidate_score(candidate: np.ndarray) -> float:
+            moments = cv2.moments(candidate)
+            cx = moments["m10"] / max(moments["m00"], 1)
+            cy = moments["m01"] / max(moments["m00"], 1)
+            distance = float(np.hypot(cx - px, cy - py))
+            brightness_score = 0.0
+            if brightness is not None:
+                region = np.zeros_like(mask)
+                cv2.drawContours(region, [candidate], -1, 255, -1)
+                brightness_score = float(cv2.mean(brightness, mask=region)[0]) / 255.0
+            return brightness_score * 2.0 - distance / max_track_jump
+
+        contour = max(candidates, key=candidate_score)
+    elif brightness is None:
+        contour = max(candidates, key=cv2.contourArea)
+    else:
+        contour = max(
+            candidates,
+            key=lambda candidate: cv2.mean(brightness, mask=cv2.drawContours(
+                np.zeros_like(mask), [candidate], -1, 255, -1
+            ))[0],
+        )
+    area = cv2.contourArea(contour)
 
     moments = cv2.moments(contour)
     if moments["m00"] == 0:
@@ -205,6 +314,7 @@ def print_coordinate(
     inside_frame: bool,
     screen_size: tuple[int, int],
     started_at: float,
+    motion_px: float = 0.0,
 ) -> None:
     width, height = frame_size
     screen_width, screen_height = screen_size
@@ -220,7 +330,12 @@ def print_coordinate(
         "screen_height": screen_height,
         "frame_width": width,
         "frame_height": height,
+        "motion_px": round(motion_px, 2),
+        "moving": motion_px >= 1.0,
     }
+    cursor = get_cursor_position()
+    payload["mouse_x"] = cursor[0] if cursor else None
+    payload["mouse_y"] = cursor[1] if cursor else None
     print(json.dumps(payload, ensure_ascii=False), flush=True)
 
 
@@ -270,11 +385,17 @@ def main() -> int:
     args.width = config["camera_width"] if args.width is None else args.width
     args.height = config["camera_height"] if args.height is None else args.height
     args.min_area = config["min_area"] if args.min_area is None else args.min_area
+    max_area = float(config.get("max_area", 2000.0))
+    min_pointer_area = float(config.get("min_pointer_area", 20.0))
+    max_pointer_aspect = float(config.get("max_pointer_aspect", 2.5))
+    min_circularity = float(config.get("min_pointer_circularity", 0.45))
+    max_track_jump = float(config.get("max_track_jump", 140.0))
     args.smoothing = config["smoothing"] if args.smoothing is None else args.smoothing
     args.ir_min_value = config["ir_min_value"] if args.ir_min_value is None else args.ir_min_value
     mouse_enabled = (
         config["mouse_control"] if args.mouse_control is None else args.mouse_control
     )
+    no_preview = config["no_preview"] if args.no_preview is None else args.no_preview
     screen_width = config["screen_width"] if args.screen_width is None else args.screen_width
     screen_height = config["screen_height"] if args.screen_height is None else args.screen_height
     try:
@@ -289,6 +410,19 @@ def main() -> int:
     if args.color not in COLOR_RANGES:
         print(f"Unsupported color in config: {args.color}", file=sys.stderr)
         return 2
+    # A run must use exactly one imaging mode.  RealSense must also expose
+    # the stream that matches the selected detector; never start IR and color
+    # streams together or silently process the wrong one.
+    realsense_stream = str(config.get("realsense_stream", "infrared")).lower()
+    if args.source == "realsense":
+        expected_stream = "infrared" if args.color == "ir" else "color"
+        if realsense_stream != expected_stream:
+            print(
+                f"Color mode '{args.color}' requires RealSense stream "
+                f"'{expected_stream}', got '{realsense_stream}'",
+                file=sys.stderr,
+            )
+            return 2
     if screen_width <= 0 or screen_height <= 0:
         print("Screen width and height must be greater than 0", file=sys.stderr)
         return 2
@@ -308,15 +442,21 @@ def main() -> int:
             return 2
         print("Direct mouse control: ENABLED", file=sys.stderr)
 
+    mouse_enabled_runtime = mouse is not None
+
     try:
         if args.source == "realsense":
             camera = RealSenseCamera(
-                stream=config["realsense_stream"],
+                stream=realsense_stream,
                 stream_index=int(config["realsense_index"]),
                 width=args.width,
                 height=args.height,
                 fps=int(config["realsense_fps"]),
                 disable_emitter=bool(config["disable_emitter"]),
+                exposure=float(config["exposure"]) if config.get("exposure") is not None else None,
+                gain=float(config["gain"]) if config.get("gain") is not None else None,
+                auto_exposure=bool(config.get("auto_exposure", False)),
+                dual_stream=bool(config.get("dual_stream", False)),
             )
         else:
             camera = OpenCVCamera(args.camera, args.width, args.height)
@@ -324,15 +464,20 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return 1
 
-    ok, first_frame = camera.read()
+    dual_stream = isinstance(camera, RealSenseCamera) and bool(config.get("dual_stream", False))
+    if dual_stream:
+        ok, first_frame, first_rgb_frame = camera.read_dual()
+    else:
+        ok, first_frame = camera.read()
+        first_rgb_frame = None
     if not ok or first_frame is None:
         camera.release()
         print("Cannot read first frame from camera", file=sys.stderr)
         return 1
 
     actual_height, actual_width = first_frame.shape[:2]
-    preview_enabled = not args.no_preview and has_gui_support()
-    if not args.no_preview and not preview_enabled:
+    preview_enabled = not no_preview and has_gui_support()
+    if not no_preview and not preview_enabled:
         print(
             "OpenCV không có GUI support; chuyển sang chế độ không preview. "
             "Dùng opencv-python thay cho opencv-python-headless để xem cửa sổ.",
@@ -346,24 +491,78 @@ def main() -> int:
     )
 
     smoothed: tuple[float, float] | None = None
+    previous_point: tuple[int, int] | None = None
+    lost_frames = 0
+    calibration_points: list[tuple[int, int]] = []
+    print("Calibration: aim at top-left and press \\. Then aim at bottom-right and press \\.", file=sys.stderr)
     started_at = time.time()
+    background_subtractor = None
+    if args.color == "ir" and bool(config.get("background_subtraction", True)):
+        background_subtractor = cv2.createBackgroundSubtractorMOG2(
+            history=int(config.get("background_history", 120)),
+            varThreshold=float(config.get("background_var_threshold", 24.0)),
+            detectShadows=False,
+        )
 
     try:
         while True:
             if first_frame is not None:
                 ok, frame = True, first_frame
+                rgb_frame = first_rgb_frame
                 first_frame = None
+                first_rgb_frame = None
             else:
-                ok, frame = camera.read()
+                if dual_stream:
+                    ok, frame, rgb_frame = camera.read_dual()
+                else:
+                    ok, frame = camera.read()
+                    rgb_frame = None
             if not ok:
                 print("Cannot read frame from camera", file=sys.stderr)
                 break
 
             height, width = frame.shape[:2]
-            mask = make_mask(frame, args.color, args.ir_min_value)
-            point = find_laser_point(mask, args.min_area)
+            threshold = (
+                config.get("ir_local_threshold", 40)
+                if args.color == "ir"
+                else args.ir_min_value
+            )
+            mask = make_mask(frame, args.color, threshold)
+            brightness = (
+                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                if frame.ndim == 3
+                else frame
+            )
+            if background_subtractor is not None:
+                foreground = background_subtractor.apply(
+                    brightness,
+                    learningRate=float(config.get("background_learning_rate", 0.001)),
+                )
+                mask = cv2.bitwise_and(mask, foreground)
+            ir_point = find_laser_point(
+                mask, args.min_area, max_area,
+                min_pointer_area, max_pointer_aspect,
+                brightness,
+                smoothed and (round(smoothed[0]), round(smoothed[1])),
+                min_circularity,
+                max_track_jump,
+            )
+            red_point = None
+            if rgb_frame is not None:
+                red_point = find_red_point(
+                    rgb_frame,
+                    float(config.get("red_min_area", 5.0)),
+                    float(config.get("red_max_area", 1000.0)),
+                )
+            point = ir_point
+            if dual_stream and bool(config.get("fusion_require_red", True)):
+                if ir_point is None or red_point is None:
+                    point = None
+                elif np.hypot(ir_point[0] - red_point[0], ir_point[1] - red_point[1]) > float(config.get("fusion_max_distance", 40.0)):
+                    point = None
 
             if point is not None:
+                lost_frames = 0
                 if smoothed is None:
                     smoothed = (float(point[0]), float(point[1]))
                 else:
@@ -374,8 +573,12 @@ def main() -> int:
                     )
                 output_point = (round(smoothed[0]), round(smoothed[1]))
             else:
-                smoothed = None
-                output_point = None
+                lost_frames += 1
+                if smoothed is not None and lost_frames <= int(config.get("max_lost_frames", 4)):
+                    output_point = (round(smoothed[0]), round(smoothed[1]))
+                else:
+                    smoothed = None
+                    output_point = None
 
             screen_point, inside_frame = map_to_screen(
                 output_point,
@@ -390,9 +593,44 @@ def main() -> int:
                 inside_frame,
                 (screen_width, screen_height),
                 started_at,
+                (
+                    float(np.hypot(output_point[0] - previous_point[0], output_point[1] - previous_point[1]))
+                    if output_point is not None and previous_point is not None
+                    else 0.0
+                ),
             )
+            previous_point = output_point
             if mouse is not None:
                 mouse.move_to(screen_point if inside_frame else None)
+
+            # Console calibration works with --no-preview as well. The key is
+            # deliberately handled only when a valid laser point is present.
+            if msvcrt.kbhit():
+                key = msvcrt.getwch()
+                if key.lower() == "m":
+                    if mouse_enabled_runtime:
+                        mouse_enabled_runtime = False
+                        mouse = None
+                    else:
+                        try:
+                            mouse = MouseController()
+                            mouse_enabled_runtime = True
+                        except RuntimeError as error:
+                            print(str(error), file=sys.stderr)
+                    print(
+                        f"Mouse control: {'ON' if mouse_enabled_runtime else 'OFF'}",
+                        file=sys.stderr,
+                    )
+                if key == "\\" and output_point is not None:
+                    calibration_points.append(output_point)
+                    if len(calibration_points) == 1:
+                        config["top_left"] = list(output_point)
+                        print(f"Mapped top-left: {output_point}. Aim bottom-right and press \\.", file=sys.stderr)
+                    elif len(calibration_points) == 2:
+                        config["bottom_right"] = list(output_point)
+                        save_config(args.config, config)
+                        print(f"Mapped bottom-right: {output_point}. Calibration saved.", file=sys.stderr)
+                        calibration_points.clear()
 
             if preview_enabled:
                 preview = (
@@ -442,9 +680,24 @@ def main() -> int:
                     )
 
                 try:
-                    cv2.imshow("Laser Tracker", preview)
+                    preview_title = "IR Preview" if args.color == "ir" else "RGB Preview"
+                    cv2.imshow(preview_title, preview)
                     cv2.imshow("Laser Mask", mask)
                     key = cv2.waitKey(1) & 0xFF
+                    if key in (ord("m"), ord("M")):
+                        if mouse_enabled_runtime:
+                            mouse_enabled_runtime = False
+                            mouse = None
+                        else:
+                            try:
+                                mouse = MouseController()
+                                mouse_enabled_runtime = True
+                            except RuntimeError as error:
+                                print(str(error), file=sys.stderr)
+                        print(
+                            f"Mouse control: {'ON' if mouse_enabled_runtime else 'OFF'}",
+                            file=sys.stderr,
+                        )
                     if key in (ord("q"), 27):
                         break
                 except cv2.error:
