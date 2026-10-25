@@ -15,7 +15,9 @@ import ctypes.wintypes
 import json
 import msvcrt
 from pathlib import Path
+import queue
 import sys
+import threading
 import time
 from dataclasses import dataclass
 
@@ -50,8 +52,7 @@ DEFAULT_CONFIG = {
     "color": "red",
     "camera_width": 1280,
     "camera_height": 720,
-    "top_left": [0, 0],
-    "bottom_right": [1279, 719],
+    "screen_corners": [[0, 0], [1279, 0], [1279, 719], [0, 719]],
     "screen_width": 1920,
     "screen_height": 1080,
     "min_area": 4.0,
@@ -79,7 +80,12 @@ DEFAULT_CONFIG = {
     "ir_min_value": 180,
     "ir_local_threshold": 40,
     "mouse_control": False,
+    "mouse_click_debug": False,
     "no_preview": False,
+    "control_window": {
+        "enabled": False,
+        "title": "Laser Mouse Control",
+    },
 }
 
 
@@ -97,6 +103,242 @@ class MouseController:
             return
         self.set_cursor_pos(int(point[0]), int(point[1]))
         self.last_position = point
+
+class ControlPanel:
+    """Small Windows control window for headless camera operation."""
+
+    def __init__(
+        self,
+        title: str,
+        mouse_enabled: bool,
+        screen_corners: list[list[int]],
+        screen_width: int,
+        screen_height: int,
+        preview_enabled: bool,
+    ):
+        self.title = title
+        self.mouse_enabled = mouse_enabled
+        self.screen_corners = screen_corners
+        self.screen_width = screen_width
+        self.screen_height = screen_height
+        self.preview_enabled = preview_enabled
+        self.status = "Starting..."
+        self.coordinates = "-"
+        self.last_mouse_event = "No mouse click received"
+        self.actions: queue.Queue[str] = queue.Queue()
+        self.lock = threading.Lock()
+        self.root = None
+        self.tk = None
+
+    def start(self) -> None:
+        self._create_ui()
+
+    def _create_ui(self) -> None:
+        try:
+            import tkinter as tk
+        except ImportError:
+            with self.lock:
+                self.status = "Tkinter is not available"
+            return
+
+        self.tk = tk
+        root = tk.Tk()
+        self.root = root
+        root.title(self.title)
+        root.resizable(False, False)
+        root.attributes("-topmost", True)
+
+        status_var = tk.StringVar(value="Starting...")
+        coordinate_var = tk.StringVar(value="Coordinates: -")
+        click_var = tk.StringVar(value="Last click: -")
+        mouse_var = tk.BooleanVar(value=self.mouse_enabled)
+        preview_var = tk.BooleanVar(value=self.preview_enabled)
+
+        def set_mouse(value: bool) -> None:
+            with self.lock:
+                self.mouse_enabled = value
+            status_var.set("Mouse: ON" if value else "Mouse: OFF")
+
+        def toggle_mouse() -> None:
+            set_mouse(not mouse_var.get())
+            mouse_var.set(self.mouse_enabled)
+
+        def emergency_stop() -> None:
+            set_mouse(False)
+            mouse_var.set(False)
+            self.actions.put("stop")
+
+        def exit_program() -> None:
+            set_mouse(False)
+            mouse_var.set(False)
+            self.actions.put("exit")
+
+        def save_settings() -> None:
+            try:
+                values = []
+                for name in ("top_left", "top_right", "bottom_right", "bottom_left"):
+                    values.append([
+                        int(entries[name][0].get()),
+                        int(entries[name][1].get()),
+                    ])
+                settings = {
+                    "screen_corners": values,
+                    "screen_width": int(width_entry.get()),
+                    "screen_height": int(height_entry.get()),
+                }
+                self.actions.put(("settings", settings))
+                status_var.set("Calibration settings queued")
+            except ValueError:
+                status_var.set("Invalid calibration values")
+
+        def toggle_preview() -> None:
+            self.actions.put(("preview", bool(preview_var.get())))
+
+        tk.Label(root, text="Laser Mouse Control", font=("Segoe UI", 12, "bold")).pack(
+            padx=14, pady=(12, 4)
+        )
+        tk.Label(root, textvariable=status_var).pack(padx=14, pady=2)
+        tk.Label(root, textvariable=coordinate_var).pack(padx=14, pady=2)
+        tk.Label(root, textvariable=click_var).pack(padx=14, pady=2)
+        tk.Checkbutton(
+            root,
+            text="Mouse tracking",
+            variable=mouse_var,
+            command=lambda: set_mouse(mouse_var.get()),
+        ).pack(padx=14, pady=4)
+
+        calibration_frame = tk.LabelFrame(root, text="Screen calibration")
+        calibration_frame.pack(padx=14, pady=4, fill="x")
+        headers = ("Point", "X", "Y")
+        for column, header in enumerate(headers):
+            tk.Label(calibration_frame, text=header).grid(row=0, column=column, padx=3, pady=2)
+        entries = {}
+        corner_names = ("top_left", "top_right", "bottom_right", "bottom_left")
+        corner_labels = ("Top-left", "Top-right", "Bottom-right", "Bottom-left")
+        for row, (name, label) in enumerate(zip(corner_names, corner_labels), start=1):
+            tk.Label(calibration_frame, text=label).grid(row=row, column=0, sticky="w", padx=3)
+            fields = []
+            point = self.screen_corners[row - 1]
+            for column, value in ((1, point[0]), (2, point[1])):
+                entry = tk.Entry(calibration_frame, width=7)
+                entry.insert(0, str(value))
+                entry.grid(row=row, column=column, padx=3, pady=2)
+                fields.append(entry)
+            entries[name] = fields
+        tk.Label(calibration_frame, text="Screen size").grid(row=5, column=0, sticky="w", padx=3, pady=2)
+        width_entry = tk.Entry(calibration_frame, width=7)
+        width_entry.insert(0, str(self.screen_width))
+        width_entry.grid(row=5, column=1, padx=3)
+        height_entry = tk.Entry(calibration_frame, width=7)
+        height_entry.insert(0, str(self.screen_height))
+        height_entry.grid(row=5, column=2, padx=3)
+        tk.Button(calibration_frame, text="Save calibration", command=save_settings).grid(
+            row=6, column=0, columnspan=3, padx=3, pady=4, sticky="ew"
+        )
+        tk.Checkbutton(
+            root,
+            text="Camera preview",
+            variable=preview_var,
+            command=toggle_preview,
+        ).pack(padx=14, pady=4)
+
+        tk.Button(root, text="EMERGENCY STOP", fg="white", bg="#b00020", command=emergency_stop).pack(
+            padx=14, pady=(4, 12), fill="x"
+        )
+        tk.Button(root, text="EXIT PROGRAM", command=exit_program).pack(
+            padx=14, pady=(0, 12), fill="x"
+        )
+
+        root.bind("<Escape>", lambda _event: emergency_stop())
+        root.bind("m", lambda _event: toggle_mouse())
+        root.protocol("WM_DELETE_WINDOW", exit_program)
+
+        def refresh() -> None:
+            with self.lock:
+                status = self.status
+                coordinates = self.coordinates
+                last_mouse_event = self.last_mouse_event
+                mouse_state = self.mouse_enabled
+            status_var.set(status)
+            coordinate_var.set(f"Coordinates: {coordinates}")
+            click_var.set(f"Last click: {last_mouse_event}")
+            mouse_var.set(mouse_state)
+            root.after(100, refresh)
+
+        refresh()
+
+    def process_events(self) -> None:
+        """Pump Tk events from the main thread."""
+        if self.root is None:
+            return
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except self.tk.TclError:
+            self.root = None
+            self.actions.put("exit")
+
+    def close(self) -> None:
+        """Destroy Tk objects on the same thread that created them."""
+        if self.root is not None:
+            try:
+                self.root.destroy()
+            except self.tk.TclError:
+                pass
+            self.root = None
+
+    def set_status(self, status: str, coordinates: str = "-") -> None:
+        with self.lock:
+            self.status = status
+            self.coordinates = coordinates
+
+    def notify_mouse_click(self, button: str) -> None:
+        with self.lock:
+            self.last_mouse_event = f"{button.upper()} CLICK"
+
+    def is_mouse_enabled(self) -> bool:
+        with self.lock:
+            return self.mouse_enabled
+
+    def consume_actions(self) -> list[str]:
+        actions = []
+        while True:
+            try:
+                actions.append(self.actions.get_nowait())
+            except queue.Empty:
+                return actions
+
+
+class MouseClickMonitor:
+    """Observe OS-level mouse clicks, including Bluetooth HID mouse events."""
+
+    def __init__(self, panel: ControlPanel | None):
+        self.panel = panel
+        self.listener = None
+
+    def start(self) -> None:
+        try:
+            from pynput import mouse as pynput_mouse
+        except ImportError as error:
+            raise RuntimeError(
+                "Mouse click debug requires pynput. "
+                "Install it with: python -m pip install pynput"
+            ) from error
+
+        def on_click(_x: int, _y: int, button: object, pressed: bool) -> None:
+            if not pressed:
+                return
+            name = str(button).split(".")[-1]
+            if name in ("left", "right") and self.panel is not None:
+                self.panel.notify_mouse_click(name)
+
+        self.listener = pynput_mouse.Listener(on_click=on_click)
+        self.listener.daemon = True
+        self.listener.start()
+
+    def stop(self) -> None:
+        if self.listener is not None:
+            self.listener.stop()
 
 
 def get_cursor_position() -> tuple[int, int] | None:
@@ -341,29 +583,48 @@ def print_coordinate(
 
 def map_to_screen(
     point: tuple[int, int] | None,
-    top_left: tuple[int, int],
-    bottom_right: tuple[int, int],
+    transform: np.ndarray | None,
+    screen_corners: list[list[int]],
     screen_size: tuple[int, int],
 ) -> tuple[tuple[int, int] | None, bool]:
-    if point is None:
+    if point is None or transform is None:
         return None, False
-
-    x1, y1 = top_left
-    x2, y2 = bottom_right
     screen_width, screen_height = screen_size
-    if x2 <= x1 or y2 <= y1:
+    if len(screen_corners) != 4:
         return None, False
-
-    rx = (point[0] - x1) / (x2 - x1)
-    ry = (point[1] - y1) / (y2 - y1)
-    inside = 0 <= rx <= 1 and 0 <= ry <= 1
+    inside = cv2.pointPolygonTest(
+        np.asarray(screen_corners, dtype=np.float32),
+        (float(point[0]), float(point[1])),
+        False,
+    ) >= 0
     if not inside:
         return None, False
-
+    mapped = cv2.perspectiveTransform(
+        np.asarray([[[point[0], point[1]]]], dtype=np.float32), transform
+    )[0, 0]
     return (
-        round(rx * (screen_width - 1)),
-        round(ry * (screen_height - 1)),
+        max(0, min(screen_width - 1, round(float(mapped[0])))),
+        max(0, min(screen_height - 1, round(float(mapped[1])))),
     ), True
+
+
+def make_screen_transform(
+    screen_corners: list[list[int]], screen_size: tuple[int, int]
+) -> np.ndarray | None:
+    if len(screen_corners) != 4:
+        return None
+    try:
+        source = np.asarray(screen_corners, dtype=np.float32)
+        if cv2.contourArea(source.reshape((-1, 1, 2))) <= 0:
+            return None
+        width, height = screen_size
+        destination = np.asarray(
+            [[0, 0], [width - 1, 0], [width - 1, height - 1], [0, height - 1]],
+            dtype=np.float32,
+        )
+        return cv2.getPerspectiveTransform(source, destination)
+    except (TypeError, ValueError, cv2.error):
+        return None
 
 
 def has_gui_support() -> bool:
@@ -374,6 +635,15 @@ def has_gui_support() -> bool:
         return False
     gui_line = gui_section[1].splitlines()[0].strip().upper()
     return gui_line not in {"", "NONE"}
+
+
+def close_preview_windows() -> None:
+    """Close OpenCV windows without interrupting the camera loop."""
+    try:
+        cv2.destroyAllWindows()
+        cv2.waitKey(1)
+    except cv2.error:
+        pass
 
 
 def main() -> int:
@@ -396,16 +666,19 @@ def main() -> int:
         config["mouse_control"] if args.mouse_control is None else args.mouse_control
     )
     no_preview = config["no_preview"] if args.no_preview is None else args.no_preview
+    control_config = config.get("control_window", {})
+    if not isinstance(control_config, dict):
+        control_config = {}
+    control_window_enabled = bool(control_config.get("enabled", False))
+    control_title = str(control_config.get("title", "Laser Mouse Control"))
     screen_width = config["screen_width"] if args.screen_width is None else args.screen_width
     screen_height = config["screen_height"] if args.screen_height is None else args.screen_height
     try:
-        top_left = (int(config["top_left"][0]), int(config["top_left"][1]))
-        bottom_right = (
-            int(config["bottom_right"][0]),
-            int(config["bottom_right"][1]),
-        )
+        screen_corners = [
+            [int(point[0]), int(point[1])] for point in config["screen_corners"]
+        ]
     except (KeyError, TypeError, ValueError, IndexError):
-        print("top_left and bottom_right must be [x, y] in config.json", file=sys.stderr)
+        print("screen_corners must contain four [x, y] points", file=sys.stderr)
         return 2
     if args.color not in COLOR_RANGES:
         print(f"Unsupported color in config: {args.color}", file=sys.stderr)
@@ -426,8 +699,9 @@ def main() -> int:
     if screen_width <= 0 or screen_height <= 0:
         print("Screen width and height must be greater than 0", file=sys.stderr)
         return 2
-    if bottom_right[0] <= top_left[0] or bottom_right[1] <= top_left[1]:
-        print("bottom_right must be lower-right of top_left", file=sys.stderr)
+    transform = make_screen_transform(screen_corners, (screen_width, screen_height))
+    if transform is None:
+        print("screen_corners must define a valid four-point quadrilateral", file=sys.stderr)
         return 2
     if not 0 < args.smoothing <= 1:
         print("--smoothing must be greater than 0 and at most 1", file=sys.stderr)
@@ -443,6 +717,27 @@ def main() -> int:
         print("Direct mouse control: ENABLED", file=sys.stderr)
 
     mouse_enabled_runtime = mouse is not None
+    control_panel = None
+    if control_window_enabled:
+        control_panel = ControlPanel(
+            control_title,
+            mouse_enabled_runtime,
+            screen_corners,
+            screen_width,
+            screen_height,
+            not no_preview,
+        )
+        control_panel.start()
+        print("Control panel: ENABLED", file=sys.stderr)
+    click_monitor = None
+    if control_panel is not None and bool(config.get("mouse_click_debug", False)):
+        try:
+            click_monitor = MouseClickMonitor(control_panel)
+            click_monitor.start()
+            print("Mouse click debug: ENABLED", file=sys.stderr)
+        except RuntimeError as error:
+            print(str(error), file=sys.stderr)
+    should_exit = False
 
     try:
         if args.source == "realsense":
@@ -493,8 +788,6 @@ def main() -> int:
     smoothed: tuple[float, float] | None = None
     previous_point: tuple[int, int] | None = None
     lost_frames = 0
-    calibration_points: list[tuple[int, int]] = []
-    print("Calibration: aim at top-left and press \\. Then aim at bottom-right and press \\.", file=sys.stderr)
     started_at = time.time()
     background_subtractor = None
     if args.color == "ir" and bool(config.get("background_subtraction", True)):
@@ -582,8 +875,8 @@ def main() -> int:
 
             screen_point, inside_frame = map_to_screen(
                 output_point,
-                top_left,
-                bottom_right,
+                transform,
+                screen_corners,
                 (screen_width, screen_height),
             )
             print_coordinate(
@@ -600,8 +893,74 @@ def main() -> int:
                 ),
             )
             previous_point = output_point
+            if control_panel is not None:
+                control_panel.process_events()
+            if control_panel is not None:
+                requested_mouse = control_panel.is_mouse_enabled()
+                if requested_mouse and mouse is None:
+                    try:
+                        mouse = MouseController()
+                        mouse_enabled_runtime = True
+                    except RuntimeError as error:
+                        control_panel.set_status(str(error))
+                elif not requested_mouse and mouse is not None:
+                    mouse = None
+                    mouse_enabled_runtime = False
+
             if mouse is not None:
                 mouse.move_to(screen_point if inside_frame else None)
+
+            if control_panel is not None:
+                status = "Mouse: ON" if mouse is not None else "Mouse: OFF"
+                if output_point is None:
+                    status += " | Laser lost"
+                elif not inside_frame:
+                    status += " | Outside frame"
+                control_panel.set_status(
+                    status,
+                    f"camera=({output_point[0]}, {output_point[1]}) "
+                    f"screen=({screen_point[0]}, {screen_point[1]})"
+                    if output_point is not None and screen_point is not None
+                    else "-",
+                )
+                for action in control_panel.consume_actions():
+                    if isinstance(action, tuple):
+                        action_name, payload = action
+                        if action_name == "settings":
+                            new_corners = payload["screen_corners"]
+                            new_width = payload["screen_width"]
+                            new_height = payload["screen_height"]
+                            new_transform = make_screen_transform(
+                                new_corners, (new_width, new_height)
+                            )
+                            if new_transform is None:
+                                control_panel.set_status("Invalid 4-point calibration")
+                            else:
+                                screen_corners = new_corners
+                                screen_width = new_width
+                                screen_height = new_height
+                                transform = new_transform
+                                config["screen_corners"] = screen_corners
+                                config["screen_width"] = screen_width
+                                config["screen_height"] = screen_height
+                                save_config(args.config, config)
+                                control_panel.set_status("Calibration saved")
+                        elif action_name == "preview":
+                            preview_enabled = bool(payload) and has_gui_support()
+                            if not preview_enabled:
+                                close_preview_windows()
+                        continue
+                    if action == "stop":
+                        mouse = None
+                        mouse_enabled_runtime = False
+                        continue
+                    if action == "exit":
+                        mouse = None
+                        mouse_enabled_runtime = False
+                        should_exit = True
+                        continue
+                if should_exit:
+                    break
 
             # Console calibration works with --no-preview as well. The key is
             # deliberately handled only when a valid laser point is present.
@@ -621,44 +980,26 @@ def main() -> int:
                         f"Mouse control: {'ON' if mouse_enabled_runtime else 'OFF'}",
                         file=sys.stderr,
                     )
-                if key == "\\" and output_point is not None:
-                    calibration_points.append(output_point)
-                    if len(calibration_points) == 1:
-                        config["top_left"] = list(output_point)
-                        print(f"Mapped top-left: {output_point}. Aim bottom-right and press \\.", file=sys.stderr)
-                    elif len(calibration_points) == 2:
-                        config["bottom_right"] = list(output_point)
-                        save_config(args.config, config)
-                        print(f"Mapped bottom-right: {output_point}. Calibration saved.", file=sys.stderr)
-                        calibration_points.clear()
-
             if preview_enabled:
                 preview = (
                     cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
                     if frame.ndim == 2
                     else frame.copy()
                 )
-                cv2.circle(preview, top_left, 8, (0, 255, 0), -1)
-                cv2.circle(preview, bottom_right, 8, (0, 0, 255), -1)
-                cv2.rectangle(preview, top_left, bottom_right, (0, 255, 255), 2)
-                cv2.putText(
-                    preview,
-                    "TOP LEFT",
-                    (top_left[0] + 10, top_left[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 255, 0),
-                    2,
-                )
-                cv2.putText(
-                    preview,
-                    "BOTTOM RIGHT",
-                    (bottom_right[0] - 160, bottom_right[1] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55,
-                    (0, 0, 255),
-                    2,
-                )
+                polygon = np.asarray(screen_corners, dtype=np.int32).reshape((-1, 1, 2))
+                cv2.polylines(preview, [polygon], True, (0, 255, 255), 2)
+                for index, corner in enumerate(screen_corners):
+                    color = (0, 255, 0) if index == 0 else (255, 100, 0)
+                    cv2.circle(preview, tuple(corner), 8, color, -1)
+                    cv2.putText(
+                        preview,
+                        ("TL", "TR", "BR", "BL")[index],
+                        (corner[0] + 10, corner[1] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.55,
+                        color,
+                        2,
+                    )
                 if output_point is not None:
                     cv2.circle(preview, output_point, 12, (0, 255, 0), 2)
                     cv2.drawMarker(
@@ -702,17 +1043,18 @@ def main() -> int:
                         break
                 except cv2.error:
                     preview_enabled = False
+                    close_preview_windows()
                     print(
                         "Không thể mở cửa sổ OpenCV; tiếp tục ở chế độ không preview.",
                         file=sys.stderr,
                     )
     finally:
+        if click_monitor is not None:
+            click_monitor.stop()
+        if control_panel is not None:
+            control_panel.close()
         camera.release()
-        if preview_enabled:
-            try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
+        close_preview_windows()
 
     return 0
 

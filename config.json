@@ -1,11 +1,27 @@
 {
-  "camera": 1,
-  "source": "realsense",
-  "color": "ir",
+  "camera": 0,
+  "source": "opencv",
+  "color": "red",
   "camera_width": 1280,
   "camera_height": 720,
-  "top_left": [408, 212],
-  "bottom_right": [854, 469],
+  "screen_corners": [
+    [
+      300,
+      212
+    ],
+    [
+      854,
+      212
+    ],
+    [
+      854,
+      469
+    ],
+    [
+      300,
+      469
+    ]
+  ],
   "screen_width": 1920,
   "screen_height": 1080,
   "min_area": 5.0,
@@ -16,7 +32,6 @@
   "max_track_jump": 140.0,
   "max_lost_frames": 4,
   "fusion_max_distance": 40.0,
-  "fusion_require_red": false,
   "red_min_area": 5.0,
   "red_max_area": 1000.0,
   "background_subtraction": true,
@@ -24,8 +39,7 @@
   "background_var_threshold": 24.0,
   "background_learning_rate": 0.001,
   "smoothing": 0.35,
-  "realsense_stream": "infrared",
-  "dual_stream": true,
+  "realsense_stream": "red",
   "realsense_index": 1,
   "realsense_fps": 30,
   "disable_emitter": true,
@@ -35,6 +49,13 @@
   "ir_min_value": 250,
   "ir_local_threshold": 35,
   "mouse_control": false,
-  "no_preview": false,  
+  "mouse_click_debug": true,
+  "no_preview": true,
+  "control_window": {
+    "enabled": true,
+    "title": "Laser Mouse Control"
+  },
+  "fusion_require_red": false,
+  "dual_stream": true,
   "inside_frame": true
 }

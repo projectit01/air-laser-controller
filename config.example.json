@@ -1,4 +1,14 @@
-"source": "opencv",
-"color": "red",
-"source": "realsense",
-"color": "ir",
+{
+  "source": "realsense",
+  "color": "ir",
+  "screen_corners": [[0, 0], [1279, 0], [1279, 719], [0, 719]],
+  "screen_width": 1920,
+  "screen_height": 1080,
+  "no_preview": true,
+  "mouse_control": false,
+  "mouse_click_debug": true,
+  "control_window": {
+    "enabled": true,
+    "title": "Laser Mouse Control"
+  }
+}
